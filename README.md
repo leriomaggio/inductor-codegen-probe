@@ -1,4 +1,4 @@
-# inductor-codegen-probe
+# PyTorch CodeGen Probe
 
 A small self-contained probe built around a single empirical question. One
 script, no framework.
