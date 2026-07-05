@@ -1,13 +1,14 @@
 """
 probe.py: what does torch.compile's Inductor backend actually emit, per device?
 
-Empirical question: when we run torch.compile (default backend = Inductor),
-does Inductor emit Triton, and does the answer differ between CPU and MPS?
+Empirical question: when we run torch.compile (default backend = Inductor), what
+code does Inductor generate, and how does that change across the compute backends
+available on this machine (CPU, CUDA, MPS, XPU)?
 
-This script does not assume an answer. It compiles two trivial functions,
-runs them on each available device to trigger compilation, captures the code
-Inductor generated, and classifies it. Read the output, not the comments, to
-decide what MPS does.
+This script does not assume an answer. It compiles a few trivial functions, runs
+each one on every available device to trigger compilation, captures the code
+Inductor generated, and classifies it. Read the output, not the comments, to see
+which codegen path each backend takes.
 
 Run:  uv run python probe.py   (or: python probe.py inside the venv)
 Only torch is required.
@@ -18,6 +19,7 @@ from __future__ import annotations
 import inspect
 import io
 import logging
+import platform
 import re
 import traceback
 
@@ -25,7 +27,10 @@ import torch
 
 
 # --------------------------------------------------------------------------- #
-# The two functions under test: a matmul and a pointwise fusion.
+# The functions under test. Each exercises a different codegen shape:
+#   matmul     : a library-level op that Inductor tends to hand off wholesale
+#   pointwise  : an elementwise chain that Inductor can fuse into one kernel
+#   reduction  : a softmax, which fuses reductions (max, sum) with pointwise work
 # Kept trivial on purpose. We care about which codegen path is taken, not perf.
 # --------------------------------------------------------------------------- #
 def matmul(a, b):
@@ -37,8 +42,13 @@ def pointwise(a, b, c):
     return (a * b + c).relu()
 
 
+def reduction(a):
+    # Softmax over the last dim: max-reduce, subtract, exp, sum-reduce, divide.
+    return torch.softmax(a, dim=-1)
+
+
 FUNCS = {
-    "matmul": {
+    "matmul (a@b)": {
         "fn": matmul,
         "make_args": lambda dev: (
             torch.randn(64, 64, device=dev),
@@ -52,6 +62,10 @@ FUNCS = {
             torch.randn(1024, device=dev),
             torch.randn(1024, device=dev),
         ),
+    },
+    "reduction softmax(a,-1)": {
+        "fn": reduction,
+        "make_args": lambda dev: (torch.randn(64, 128, device=dev),),
     },
 }
 
@@ -131,14 +145,15 @@ def capture_generated_code(compiled, args):
 # Classification of the captured code.
 #
 # We distinguish, in priority order:
-#   Triton        : Inductor generated a Triton kernel (@triton.jit / tl.*)
+#   Triton        : Inductor generated a Triton kernel (@triton.jit / tl.*).
+#                   This is the GPU codegen path used for CUDA and XPU.
 #   Metal / MPS   : Inductor generated a Metal shader (async_compile.metal /
-#                   `kernel void`)
+#                   `kernel void`). This is the Apple Silicon GPU path.
 #   C++ / OpenMP  : Inductor generated a C++ kernel (async_compile.cpp /
-#                   cpp_fused / at::vec / #pragma omp)
+#                   cpp_fused / at::vec / #pragma omp). This is the CPU path.
 #   extern kernel : Inductor generated no kernel of its own and dispatched to an
 #                   external library op via extern_kernels.<op>(...), for example
-#                   BLAS mm on CPU or the MPS mm on MPS. No Inductor codegen.
+#                   a BLAS/cuBLAS matmul. No Inductor codegen for that op.
 #   fallback      : none of the above matched.
 #
 # Note: the wrapper module always *imports* `extern_kernels`, so we must look for
@@ -207,7 +222,7 @@ def interesting_excerpt(code: str, n: int = 15) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Environment facts.
+# Environment and device discovery.
 # --------------------------------------------------------------------------- #
 def default_compile_backend() -> str:
     try:
@@ -216,38 +231,88 @@ def default_compile_backend() -> str:
         return "unknown"
 
 
-def available_devices() -> list[str]:
-    devices = ["cpu"]
+def _mps_available() -> bool:
     try:
-        if torch.backends.mps.is_available():
-            devices.append("mps")
+        return torch.backends.mps.is_available()
     except Exception:  # noqa: BLE001
-        pass
+        return False
+
+
+def _cuda_available() -> bool:
+    try:
+        return torch.cuda.is_available()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _xpu_available() -> bool:
+    try:
+        return hasattr(torch, "xpu") and torch.xpu.is_available()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def discover_devices() -> list[tuple[str, str]]:
+    """Return (device_string, human_label) for every backend we can probe.
+
+    CPU is always present. The accelerators are added only when their runtime
+    reports itself available, so the same script runs unchanged on a laptop with
+    only MPS, a CUDA box, an Intel XPU host, or a plain CPU machine.
+    """
+    devices: list[tuple[str, str]] = [("cpu", platform.processor() or platform.machine())]
+
+    if _cuda_available():
+        try:
+            cc = ".".join(str(x) for x in torch.cuda.get_device_capability(0))
+            label = f"{torch.cuda.get_device_name(0)} (CUDA, sm_{cc})"
+        except Exception:  # noqa: BLE001
+            label = "CUDA device"
+        devices.append(("cuda", label))
+
+    if _mps_available():
+        devices.append(("mps", "Apple GPU (Metal / MPS)"))
+
+    if _xpu_available():
+        try:
+            label = f"{torch.xpu.get_device_name(0)} (Intel XPU)"
+        except Exception:  # noqa: BLE001
+            label = "Intel XPU device"
+        devices.append(("xpu", label))
+
     return devices
+
+
+# The GPU-class codegen backends. Whether a device sits here is the substantive
+# result: it says which native kernel language Inductor targets for that GPU.
+_CODEGEN_KINDS = {"Triton", "Metal / MPS", "C++ / OpenMP"}
 
 
 # --------------------------------------------------------------------------- #
 # Main.
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    devices = discover_devices()
+
     print("=" * 70)
     print("ENVIRONMENT")
     print("=" * 70)
     print(f"torch.__version__ ............. {torch.__version__}")
-    print(f"torch.backends.mps.is_available() {torch.backends.mps.is_available()}")
     print(f"default torch.compile backend . {default_compile_backend()!r}")
-    devices = available_devices()
-    print(f"devices probed ................ {devices}")
+    print(f"cuda available ................ {_cuda_available()}")
+    print(f"mps available ................. {_mps_available()}")
+    print(f"xpu available ................. {_xpu_available()}")
+    print("devices probed:")
+    for dev, label in devices:
+        print(f"  - {dev:<5} {label}")
     print()
 
     # results[(device, func_name)] = (kind, method_or_error, code_or_None)
     results: dict[tuple[str, str], tuple[str, str, str | None]] = {}
 
-    for device in devices:
+    for device, _label in devices:
         for func_name, spec in FUNCS.items():
-            header = f"[{device}] {func_name}"
             print("-" * 70)
-            print(header)
+            print(f"[{device}] {func_name}")
             print("-" * 70)
             try:
                 args = spec["make_args"](device)
@@ -259,10 +324,10 @@ def main() -> None:
                 print(f"captured via : {method}")
                 print("generated kernel (excerpt):")
                 print(interesting_excerpt(code))
-            except Exception as exc:  # noqa: BLE001 (MPS may fail; keep going)
+            except Exception as exc:  # noqa: BLE001 (a backend may fail; keep going)
                 msg = f"{type(exc).__name__}: {exc}"
                 results[(device, func_name)] = ("ERROR", msg, None)
-                print(f"codegen kind : ERROR")
+                print("codegen kind : ERROR")
                 print(f"detail       : {msg}")
                 print(traceback.format_exc())
             print()
@@ -273,55 +338,52 @@ def main() -> None:
     print("=" * 70)
     print("SUMMARY:  device x function  ->  codegen kind")
     print("=" * 70)
-    dev_w = max(len(d) for d in devices)
+    dev_w = max(len(d) for d, _ in devices)
     fn_w = max(len(f) for f in FUNCS)
-    for device in devices:
+    for device, _label in devices:
         for func_name in FUNCS:
             kind, method, _ = results[(device, func_name)]
             print(f"  {device:<{dev_w}}  |  {func_name:<{fn_w}}  ->  {kind}   ({method})")
     print()
 
     # ----------------------------------------------------------------------- #
-    # Verdict: is MPS a Triton codegen target, or something else?
-    # Derived from the actual captured output, not assumptions.
+    # Findings: one neutral, data-driven read per device. No device is treated
+    # as the special case; each is reported on the same terms.
     # ----------------------------------------------------------------------- #
     print("=" * 70)
-    print("VERDICT")
+    print("FINDINGS  (per device, from the captured output above)")
     print("=" * 70)
-    mps_kinds = {
-        func_name: results[("mps", func_name)][0]
-        for func_name in FUNCS
-        if ("mps", func_name) in results
-    }
-    cpu_kinds = {
-        func_name: results[("cpu", func_name)][0]
-        for func_name in FUNCS
-        if ("cpu", func_name) in results
-    }
-    print(f"CPU codegen : {cpu_kinds}")
-    if not mps_kinds:
-        print("MPS was not available on this machine, so there is no MPS verdict.")
-        return
-    print(f"MPS codegen : {mps_kinds}")
+    for device, label in devices:
+        kinds = {fn: results[(device, fn)][0] for fn in FUNCS}
+        generated = {k for k in kinds.values() if k in _CODEGEN_KINDS}
+        dispatched = [fn for fn, k in kinds.items() if "extern kernel" in k]
+        errored = [fn for fn, k in kinds.items() if k == "ERROR"]
 
-    non_codegen = {"extern kernel (no Inductor codegen)", "fallback / no codegen"}
-    generated = {k for k in mps_kinds.values() if k not in non_codegen}
-    dispatched = {k for k in mps_kinds.values() if k in non_codegen}
-
-    if not generated:
-        print("\n=> On MPS, Inductor generated no kernels here; everything dispatched to")
-        print("   external ops. Inconclusive on the Triton question; try more ops.")
-    elif generated == {"Triton"}:
-        print("\n=> MPS IS a Triton codegen target: Inductor emitted Triton on MPS.")
-    elif "Triton" in generated:
-        print("\n=> MPS is PARTIALLY a Triton target: some generated kernels are Triton,")
-        print("   some are not. See the table above.")
-    else:
-        path = ", ".join(sorted(generated))
-        print(f"\n=> MPS is NOT a Triton codegen target. Where Inductor generated a kernel")
-        print(f"   (the fusible pointwise op), it emitted: {path}, not Triton.")
+        print(f"\n[{device}] {label}")
+        if generated:
+            langs = ", ".join(sorted(generated))
+            triton = "yes" if "Triton" in generated else "no"
+            print(f"  Inductor-generated kernels : {langs}")
+            print(f"  Triton emitted here        : {triton}")
+        else:
+            print("  Inductor-generated kernels : none captured for these ops")
         if dispatched:
-            print(f"   Ops with no Inductor codegen (e.g. matmul) went to: {', '.join(sorted(dispatched))}.")
+            print(f"  handed to an extern library : {', '.join(dispatched)}")
+        if errored:
+            print(f"  failed to compile/capture   : {', '.join(errored)}")
+
+    print()
+    print("=" * 70)
+    print("READING")
+    print("=" * 70)
+    print(
+        "Inductor is one compiler front-end with several code generators behind it.\n"
+        "The device you place tensors on selects the generator: Triton for CUDA and\n"
+        "XPU GPUs, Metal for Apple MPS, vectorized C++ for CPU. Library-shaped ops\n"
+        "such as matmul are commonly dispatched to an external BLAS-style kernel\n"
+        "instead of being generated at all. The table above shows which path each\n"
+        "backend actually took on this machine, rather than assuming any of them."
+    )
 
 
 if __name__ == "__main__":
