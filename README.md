@@ -47,7 +47,21 @@ failure there prints the error and lets the rest of the run continue.
 
 ## Results
 
-Recorded on Apple Silicon with torch 2.12.1 and MPS available.
+### Machine
+
+The output below was recorded on this setup:
+
+| item     | value                                     |
+|----------|-------------------------------------------|
+| model    | Apple Mac15,6 (MacBook Pro, Apple M3 Pro) |
+| memory   | 36 GB                                     |
+| arch     | arm64                                     |
+| OS       | macOS 26.5.1 (build 25F80)                |
+| Python   | 3.12.7                                     |
+| torch    | 2.12.1                                     |
+| MPS      | available                                 |
+
+### Summary
 
 | device | function                   | codegen kind                        |
 |--------|----------------------------|-------------------------------------|
@@ -67,8 +81,112 @@ its own and dispatches to an external library op through
 codegen from Inductor is the CUDA GPU path, and it did not appear on either CPU
 or MPS here.
 
-Paste your own run below if you want to keep a record of it.
+### Full output
 
 ```
-<paste your output here>
+======================================================================
+ENVIRONMENT
+======================================================================
+torch.__version__ ............. 2.12.1
+torch.backends.mps.is_available() True
+default torch.compile backend . 'inductor'
+devices probed ................ ['cpu', 'mps']
+
+----------------------------------------------------------------------
+[cpu] matmul
+----------------------------------------------------------------------
+codegen kind : extern kernel (no Inductor codegen)
+captured via : run_and_get_triton_code
+generated kernel (excerpt):
+(from line 49)
+        assert_size_stride(arg1_1, (64, 64), (64, 1))
+        buf0 = empty_strided_cpu((64, 64), (64, 1), torch.float32)
+        # Topologically Sorted Source Nodes: [matmul], Original ATen: [aten.mm]
+        extern_kernels.mm(arg0_1, arg1_1, out=buf0)
+        del arg0_1
+        del arg1_1
+        return (buf0, )
+... (more lines)
+
+----------------------------------------------------------------------
+[cpu] pointwise (a*b+c).relu()
+----------------------------------------------------------------------
+codegen kind : C++ / OpenMP
+captured via : run_and_get_triton_code
+generated kernel (excerpt):
+(from line 32)
+cpp_fused_add_mul_relu_0 = async_compile.cpp_pybinding(['const float*', 'const float*', 'const float*', 'float*'], r'''
+#include <torch/csrc/inductor/cpp_prefix.h>
+extern "C"  void  kernel(const float* in_ptr0,
+                       const float* in_ptr1,
+                       const float* in_ptr2,
+                       float* out_ptr0)
+{
+    {
+        for(int64_t x0=static_cast<int64_t>(0LL); x0<static_cast<int64_t>(1024LL); x0+=static_cast<int64_t>(4LL))
+        {
+            {
+                if(C10_LIKELY(x0 >= static_cast<int64_t>(0) && x0 < static_cast<int64_t>(1024LL)))
+                {
+                    auto tmp0 = at::vec::Vectorized<float>::loadu(in_ptr0 + static_cast<int64_t>(x0), static_cast<int64_t>(4));
+                    auto tmp1 = at::vec::Vectorized<float>::loadu(in_ptr1 + static_cast<int64_t>(x0), static_cast<int64_t>(4));
+... (more lines)
+
+----------------------------------------------------------------------
+[mps] matmul
+----------------------------------------------------------------------
+codegen kind : extern kernel (no Inductor codegen)
+captured via : run_and_get_triton_code
+generated kernel (excerpt):
+(from line 52)
+        arg1_1 = copy_misaligned(arg1_1)
+        buf0 = empty_strided((64, 64), (64, 1), device='mps', dtype=torch.float32)
+        # Topologically Sorted Source Nodes: [matmul], Original ATen: [aten.mm]
+        extern_kernels.mm(arg0_1, arg1_1, out=buf0)
+        del arg0_1
+        del arg1_1
+        return (buf0, )
+... (more lines)
+
+----------------------------------------------------------------------
+[mps] pointwise (a*b+c).relu()
+----------------------------------------------------------------------
+codegen kind : Metal / MPS
+captured via : run_and_get_triton_code
+generated kernel (excerpt):
+(from line 31)
+generated_kernel_0 = async_compile.metal('generated_kernel_0', '''
+
+    kernel void generated_kernel_0(
+        device float* out_ptr0,
+        constant float* in_ptr0,
+        constant float* in_ptr1,
+        constant float* in_ptr2,
+        uint xindex [[thread_position_in_grid]]
+    ) {
+        int x0 = xindex;
+        auto tmp0 = in_ptr0[x0];
+        auto tmp1 = in_ptr1[x0];
+        auto tmp3 = in_ptr2[x0];
+        auto tmp2 = tmp0 * tmp1;
+        auto tmp4 = tmp2 + tmp3;
+... (more lines)
+
+======================================================================
+SUMMARY:  device x function  ->  codegen kind
+======================================================================
+  cpu  |  matmul                    ->  extern kernel (no Inductor codegen)   (run_and_get_triton_code)
+  cpu  |  pointwise (a*b+c).relu()  ->  C++ / OpenMP   (run_and_get_triton_code)
+  mps  |  matmul                    ->  extern kernel (no Inductor codegen)   (run_and_get_triton_code)
+  mps  |  pointwise (a*b+c).relu()  ->  Metal / MPS   (run_and_get_triton_code)
+
+======================================================================
+VERDICT
+======================================================================
+CPU codegen : {'matmul': 'extern kernel (no Inductor codegen)', 'pointwise (a*b+c).relu()': 'C++ / OpenMP'}
+MPS codegen : {'matmul': 'extern kernel (no Inductor codegen)', 'pointwise (a*b+c).relu()': 'Metal / MPS'}
+
+=> MPS is NOT a Triton codegen target. Where Inductor generated a kernel
+   (the fusible pointwise op), it emitted: Metal / MPS, not Triton.
+   Ops with no Inductor codegen (e.g. matmul) went to: extern kernel (no Inductor codegen).
 ```
